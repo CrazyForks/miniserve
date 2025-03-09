@@ -6,13 +6,13 @@ use std::{
 };
 
 use actix_web::http::header::HeaderMap;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 #[cfg(feature = "tls")]
 use rustls_pemfile as pemfile;
 
 use crate::{
-    args::{parse_auth, CliArgs, MediaType},
+    args::{CliArgs, MediaType, parse_auth},
     auth::RequiredAuth,
     file_utils::sanitize_path,
     listing::{SortingMethod, SortingOrder},
@@ -24,7 +24,7 @@ const ROUTE_ALPHABET: [char; 16] = [
     '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'a', 'b', 'c', 'd', 'e', 'f',
 ];
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 /// Configuration of the Miniserve application
 pub struct MiniserveConfig {
     /// Enable verbose mode
@@ -63,10 +63,16 @@ pub struct MiniserveConfig {
     /// Route prefix; Either empty or prefixed with slash
     pub route_prefix: String,
 
-    /// Randomly generated favicon route
+    /// Well-known healthcheck route (prefixed if route_prefix is provided)
+    pub healthcheck_route: String,
+
+    /// Well-known API route (prefixed if route_prefix is provided)
+    pub api_route: String,
+
+    /// Well-known favicon route (prefixed if route_prefix is provided)
     pub favicon_route: String,
 
-    /// Randomly generated css route
+    /// Well-known css route (prefixed if route_prefix is provided)
     pub css_route: String,
 
     /// Default color scheme
@@ -198,19 +204,23 @@ impl MiniserveConfig {
             }
         }
 
-        // Generate some random routes for the favicon and css so that they are very unlikely to conflict with
-        // real files.
-        // If --random-route is enabled , in order to not leak the random generated route, we must not use it
+        // Format some well-known routes at paths that are very unlikely to conflict with real
+        // files.
+        // If --random-route is enabled, in order to not leak the random generated route, we must not use it
         // as static files prefix.
         // Otherwise, we should apply route_prefix to static files.
-        let (favicon_route, css_route) = if args.random_route {
+        let (healthcheck_route, api_route, favicon_route, css_route) = if args.random_route {
             (
+                "/__miniserve_internal/healthcheck".into(),
+                "/__miniserve_internal/api".into(),
                 "/__miniserve_internal/favicon.svg".into(),
                 "/__miniserve_internal/style.css".into(),
             )
         } else {
             (
-                format!("{}/{}", route_prefix, "__miniserve_internal/favicon.ico"),
+                format!("{}/{}", route_prefix, "__miniserve_internal/healthcheck"),
+                format!("{}/{}", route_prefix, "__miniserve_internal/api"),
+                format!("{}/{}", route_prefix, "__miniserve_internal/favicon.svg"),
                 format!("{}/{}", route_prefix, "__miniserve_internal/style.css"),
             )
         };
@@ -299,6 +309,8 @@ impl MiniserveConfig {
             default_sorting_method: args.default_sorting_method,
             default_sorting_order: args.default_sorting_order,
             route_prefix,
+            healthcheck_route,
+            api_route,
             favicon_route,
             css_route,
             default_color_scheme,

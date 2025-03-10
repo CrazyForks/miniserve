@@ -4,22 +4,27 @@ use std::thread;
 use std::time::Duration;
 
 use actix_files::NamedFile;
+use actix_web::middleware::from_fn;
 use actix_web::{
-    dev::{fn_service, ServiceRequest, ServiceResponse},
+    App, HttpRequest, HttpResponse, Responder,
+    dev::{ServiceRequest, ServiceResponse, fn_service},
     guard,
-    http::{header::ContentType, Method},
-    middleware, web, App, HttpRequest, HttpResponse, Responder,
+    http::{Method, header::ContentType},
+    middleware, web,
 };
 use actix_web_httpauth::middleware::HttpAuthentication;
 use anyhow::Result;
-use clap::{crate_version, CommandFactory, Parser};
+use bytesize::ByteSize;
+use clap::{CommandFactory, Parser, crate_version};
 use colored::*;
 use dav_server::{
-    actix::{DavRequest, DavResponse},
     DavConfig, DavHandler, DavMethodSet,
+    actix::{DavRequest, DavResponse},
 };
 use fast_qr::QRBuilder;
-use log::{error, warn};
+use log::{error, info, warn};
+use percent_encoding::percent_decode_str;
+use serde::Deserialize;
 
 mod archive;
 mod args;
@@ -36,6 +41,7 @@ mod webdav_fs;
 
 use crate::config::MiniserveConfig;
 use crate::errors::{RuntimeError, StartupError};
+use crate::file_op::recursive_dir_size;
 use crate::webdav_fs::RestrictedFs;
 
 static STYLESHEET: &str = grass::include!("data/style.scss");
@@ -134,7 +140,9 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
             return Err(StartupError::NoExplicitPathAndNoTerminal);
         }
 
-        warn!("miniserve has been invoked without an explicit path so it will serve the current directory after a short delay.");
+        warn!(
+            "miniserve has been invoked without an explicit path so it will serve the current directory after a short delay."
+        );
         warn!(
             "Invoke with -h|--help to see options or invoke as `miniserve .` to hide this advice."
         );
@@ -211,14 +219,16 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
     let srv = actix_web::HttpServer::new(move || {
         App::new()
             .wrap(configure_header(&inside_config.clone()))
-            .app_data(inside_config.clone())
+            .app_data(web::Data::new(inside_config.clone()))
             .app_data(stylesheet.clone())
-            .wrap_fn(errors::error_page_middleware)
+            .wrap(from_fn(errors::error_page_middleware))
             .wrap(middleware::Logger::default())
             .wrap(middleware::Condition::new(
                 miniserve_config.compress_response,
                 middleware::Compress::default(),
             ))
+            .route(&inside_config.healthcheck_route, web::get().to(healthcheck))
+            .route(&inside_config.api_route, web::post().to(api))
             .route(&inside_config.favicon_route, web::get().to(favicon))
             .route(&inside_config.css_route, web::get().to(css))
             .service(
@@ -348,7 +358,7 @@ fn configure_app(app: &mut web::ServiceConfig, conf: &MiniserveConfig) {
             files = files.default_handler(fn_service(|req: ServiceRequest| async {
                 let (req, _) = req.into_parts();
                 let conf = req
-                    .app_data::<MiniserveConfig>()
+                    .app_data::<web::Data<MiniserveConfig>>()
                     .expect("Could not get miniserve config");
                 let mut path_base = req.path()[1..].to_string();
                 if path_base.ends_with('/') {
@@ -427,6 +437,51 @@ async fn dav_handler(req: DavRequest, davhandler: web::Data<DavHandler>) -> DavR
 
 async fn error_404(req: HttpRequest) -> Result<HttpResponse, RuntimeError> {
     Err(RuntimeError::RouteNotFoundError(req.path().to_string()))
+}
+
+async fn healthcheck() -> impl Responder {
+    HttpResponse::Ok().body("OK")
+}
+
+#[derive(Deserialize, Debug)]
+enum ApiCommand {
+    /// Request the size of a particular directory
+    DirSize(String),
+}
+
+/// This "API" is pretty shitty but frankly miniserve doesn't really need a very fancy API. Or at
+/// least I hope so.
+async fn api(
+    command: web::Json<ApiCommand>,
+    config: web::Data<MiniserveConfig>,
+) -> Result<impl Responder, RuntimeError> {
+    match command.into_inner() {
+        ApiCommand::DirSize(path) => {
+            // The dir argument might be percent-encoded so let's decode it just in case.
+            let decoded_path = percent_decode_str(&path)
+                .decode_utf8()
+                .map_err(|e| RuntimeError::ParseError(path.clone(), e.to_string()))?;
+
+            // Convert the relative dir to an absolute path on the system.
+            let sanitized_path = file_utils::sanitize_path(&*decoded_path, true)
+                .expect("Expected a path to directory");
+
+            let full_path = config
+                .path
+                .canonicalize()
+                .expect("Couldn't canonicalize path")
+                .join(sanitized_path);
+            info!("Requested directory listing for {full_path:?}");
+
+            let dir_size = recursive_dir_size(&full_path).await?;
+            if config.show_exact_bytes {
+                Ok(format!("{dir_size} B"))
+            } else {
+                let dir_size = ByteSize::b(dir_size);
+                Ok(dir_size.to_string())
+            }
+        }
+    }
 }
 
 async fn favicon() -> impl Responder {
